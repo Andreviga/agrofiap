@@ -1,0 +1,17 @@
+# Dataset de imagens (muito pesado para o GitHub)
+dataset/saudavel/
+dataset/doente/
+
+# Modelos treinados
+models/*.h5
+
+# Cache Python
+__pycache__/
+*.pyc
+
+# Ambientes virtuais
+venv/
+.env/
+
+# Relatórios gerados
+relatorio_classificacao.csv
