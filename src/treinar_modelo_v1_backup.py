@@ -1,14 +1,9 @@
 """
-AgroSmart - Script de Treinamento do Modelo CNN (v2 - Fine-Tuning)
-===================================================================
+AgroSmart - Script de Treinamento do Modelo CNN
+=================================================
 Este script treina uma Rede Neural Convolucional para classificar
 imagens de folhas como "saudável" ou "doente", utilizando Transfer
-Learning com MobileNetV2 em duas fases:
-  Fase 1: Treina apenas as camadas densas (base congelada)
-  Fase 2: Fine-tuning das últimas 30 camadas da MobileNetV2
-
-Inclui data augmentation robusto com ajuste de brilho para fotos de
-campo, EarlyStopping, ModelCheckpoint e decaimento de learning rate.
+Learning com MobileNetV2 e aceleração por GPU (NVIDIA RTX 2070).
 
 Uso:
     python src/treinar_modelo.py
@@ -19,9 +14,9 @@ import sys
 import tensorflow as tf
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
 from tensorflow.keras.applications import MobileNetV2
-from tensorflow.keras.layers import Dense, GlobalAveragePooling2D, Dropout, BatchNormalization
+from tensorflow.keras.layers import Dense, GlobalAveragePooling2D, Dropout
 from tensorflow.keras.models import Model
-from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
+from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
 
 # ============================================================
 # Configurações gerais do projeto
@@ -32,22 +27,14 @@ CAMINHO_MODELO = os.path.join(DIRETORIO_MODELOS, 'agrosmart_model.h5')
 
 TAMANHO_IMAGEM = (224, 224)   # Tamanho esperado pelo MobileNetV2
 BATCH_SIZE = 32
-
-# Fase 1 — camadas densas com base congelada
-EPOCAS_FASE1 = 15
-TAXA_APRENDIZADO_FASE1 = 1e-4
-
-# Fase 2 — fine-tuning das últimas 30 camadas da base
-EPOCAS_FASE2 = 50
-TAXA_APRENDIZADO_FASE2 = 1e-5
-CAMADAS_DESCONGELAR = 30       # Últimas N camadas da MobileNetV2 a descongelar
+EPOCAS = 20
+TAXA_APRENDIZADO = 0.0001
 
 
 def configurar_gpu():
     """
     Configura o TensorFlow para utilizar a GPU NVIDIA disponível,
     com crescimento dinâmico de memória para evitar alocação excessiva.
-    Otimizado para RTX 2070 Max-Q.
     """
     gpus = tf.config.list_physical_devices('GPU')
     if gpus:
@@ -71,6 +58,7 @@ def validar_dataset(diretorio):
         print(f"[ERRO] Diretório do dataset não encontrado: {diretorio}")
         sys.exit(1)
 
+    subpastas = os.listdir(diretorio)
     for classe in ['saudavel', 'doente']:
         caminho_classe = os.path.join(diretorio, classe)
         if not os.path.isdir(caminho_classe):
@@ -88,8 +76,7 @@ def criar_geradores(diretorio):
     """
     Cria geradores de dados para treino e validação com data augmentation
     robusto, incluindo ajuste de brilho (essencial para fotos ao ar livre
-    no campo), rotação ampla, zoom e espelhamento.
-    A validação recebe apenas normalização, sem augmentation.
+    no campo), rotação, zoom e espelhamento.
     """
     # Gerador de TREINO com augmentation agressivo para generalização
     gerador_treino = ImageDataGenerator(
@@ -138,7 +125,7 @@ def construir_modelo():
     """
     Constrói o modelo utilizando Transfer Learning com MobileNetV2.
     Fase 1: base inteiramente congelada, treina apenas camadas densas.
-    Retorna o modelo completo e a referência à base para fine-tuning.
+    O retorno inclui a referência à base para o fine-tuning posterior.
     """
     # Carrega a base MobileNetV2 sem a camada de classificação
     base = MobileNetV2(
@@ -177,9 +164,9 @@ def construir_modelo():
     return modelo, base
 
 
-def criar_callbacks():
+def criar_callbacks(fase):
     """
-    Cria callbacks para monitoramento e proteção contra overfitting.
+    Cria callbacks configurados para cada fase do treinamento.
     - ModelCheckpoint: salva SOMENTE o .h5 com a melhor val_accuracy.
     - EarlyStopping: interrompe se val_loss parar de cair por 5 épocas.
     - ReduceLROnPlateau: reduz learning rate ao estagnar (decaimento).
@@ -211,25 +198,23 @@ def criar_callbacks():
 def treinar_fase1(modelo, dados_treino, dados_validacao):
     """
     FASE 1 — Treinamento das camadas densas com base congelada.
-    Objetivo: ajustar rapidamente a cabeça de classificação antes
-    de mexer nos pesos da MobileNetV2.
+    Objetivo: ajustar a cabeça de classificação rapidamente.
     """
     os.makedirs(DIRETORIO_MODELOS, exist_ok=True)
 
     print("\n" + "=" * 60)
     print("  FASE 1: Treinamento das camadas densas (base congelada)")
-    print(f"  Épocas: {EPOCAS_FASE1} | LR: {TAXA_APRENDIZADO_FASE1}")
     print("=" * 60)
 
     historico = modelo.fit(
         dados_treino,
         validation_data=dados_validacao,
         epochs=EPOCAS_FASE1,
-        callbacks=criar_callbacks(),
+        callbacks=criar_callbacks(fase=1),
         verbose=1
     )
 
-    val_acc = max(historico.history.get('val_accuracy', [0]))
+    val_acc = historico.history.get('val_accuracy', [0])[-1]
     print(f"\n[FASE 1] Melhor val_accuracy: {val_acc:.4f}")
     return historico
 
@@ -242,21 +227,20 @@ def treinar_fase2(modelo, base, dados_treino, dados_validacao):
     """
     print("\n" + "=" * 60)
     print(f"  FASE 2: Fine-Tuning (descongelando últimas {CAMADAS_DESCONGELAR} camadas)")
-    print(f"  Épocas: {EPOCAS_FASE2} | LR: {TAXA_APRENDIZADO_FASE2}")
     print("=" * 60)
 
     # Descongela as últimas N camadas da base MobileNetV2
     base.trainable = True
-    total_camadas_base = len(base.layers)
-    for camada in base.layers[:total_camadas_base - CAMADAS_DESCONGELAR]:
+    total_camadas = len(base.layers)
+    for camada in base.layers[:total_camadas - CAMADAS_DESCONGELAR]:
         camada.trainable = False
 
-    # Conta camadas treináveis vs congeladas para log
+    # Conta camadas treináveis vs congeladas
     treinaveis = sum(1 for c in modelo.layers if c.trainable)
     congeladas = sum(1 for c in modelo.layers if not c.trainable)
     print(f"[INFO] Camadas treináveis: {treinaveis} | Congeladas: {congeladas}")
 
-    # Recompila com learning rate muito baixa para fine-tuning + decaimento
+    # Recompila com learning rate muito baixa para fine-tuning
     modelo.compile(
         optimizer=tf.keras.optimizers.Adam(learning_rate=TAXA_APRENDIZADO_FASE2),
         loss='binary_crossentropy',
@@ -267,19 +251,19 @@ def treinar_fase2(modelo, base, dados_treino, dados_validacao):
         dados_treino,
         validation_data=dados_validacao,
         epochs=EPOCAS_FASE2,
-        callbacks=criar_callbacks(),
+        callbacks=criar_callbacks(fase=2),
         verbose=1
     )
 
-    val_acc = max(historico.history.get('val_accuracy', [0]))
+    val_acc = historico.history.get('val_accuracy', [0])[-1]
     print(f"\n[FASE 2] Melhor val_accuracy: {val_acc:.4f}")
     return historico
 
 
 def main():
-    """Função principal que orquestra o pipeline de treinamento em 2 fases."""
+    """Função principal que orquestra todo o pipeline de treinamento."""
     print("=" * 60)
-    print("  AgroSmart - Treinamento do Modelo (v2 Fine-Tuning)")
+    print("  AgroSmart - Treinamento do Modelo de Classificação")
     print("=" * 60)
 
     # 1. Configura GPU
@@ -290,8 +274,8 @@ def main():
     print(f"\n[INFO] Dataset: {diretorio_abs}")
     validar_dataset(diretorio_abs)
 
-    # 3. Cria geradores de dados com augmentation robusto
-    print("\n[INFO] Preparando geradores de dados (augmentation robusto)...")
+    # 3. Cria geradores de dados
+    print("\n[INFO] Preparando geradores de dados...")
     dados_treino, dados_validacao = criar_geradores(diretorio_abs)
 
     # Exibe o mapeamento de classes
@@ -311,16 +295,16 @@ def main():
     modelo.save(CAMINHO_MODELO)
     print(f"\n[INFO] Modelo final salvo em: {os.path.abspath(CAMINHO_MODELO)}")
 
-    # 8. Exibe métricas consolidadas de ambas as fases
-    f1_best = max(historico_f1.history.get('val_accuracy', [0]))
-    f2_best = max(historico_f2.history.get('val_accuracy', [0]))
-    f2_loss = min(historico_f2.history.get('val_loss', [999]))
+    # 8. Exibe métricas finais de ambas as fases
+    f1_acc = historico_f1.history.get('val_accuracy', [0])[-1]
+    f2_acc = historico_f2.history.get('val_accuracy', [0])[-1]
+    f2_loss = historico_f2.history.get('val_loss', [0])[-1]
     print(f"\n{'=' * 60}")
     print(f"  RESULTADO FINAL")
     print(f"{'=' * 60}")
-    print(f"  Fase 1 (camadas densas)  — melhor val_accuracy: {f1_best:.4f}")
-    print(f"  Fase 2 (fine-tuning)     — melhor val_accuracy: {f2_best:.4f}")
-    print(f"  Fase 2 (fine-tuning)     — melhor val_loss:     {f2_loss:.4f}")
+    print(f"  Fase 1 (camadas densas)  — val_accuracy: {f1_acc:.4f}")
+    print(f"  Fase 2 (fine-tuning)     — val_accuracy: {f2_acc:.4f}")
+    print(f"  Fase 2 (fine-tuning)     — val_loss:     {f2_loss:.4f}")
     print(f"{'=' * 60}")
     print("[INFO] Treinamento concluído com sucesso!")
 
